@@ -1,13 +1,39 @@
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from sqlalchemy import Double, and_, case, cast, func, literal, literal_column, or_, select, tuple_
+from sqlalchemy import (
+    Double,
+    Text,
+    and_,
+    case,
+    cast,
+    exists,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    true,
+    tuple_,
+)
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.cache import invalidate_namespace
-from app.models.home import Banner, Category, DataStatus, Destination, District
+from app.core.config import settings
+from app.models.home import (
+    Banner,
+    Category,
+    CrowdLevel,
+    CrowdStatus,
+    DataStatus,
+    Destination,
+    District,
+)
 from app.schemas.home import BannerCreate, DestinationCreate
 
 # Semua cache halaman home/pencarian ada di namespace ini. Panggil
@@ -18,6 +44,20 @@ HOME_CACHE_NAMESPACE = "home"
 SEARCH_TS_CONFIG = "indonesian"
 
 SortOption = Literal["relevance", "name", "rating", "newest"]
+
+
+@dataclass(frozen=True)
+class DestinationFilters:
+    """Filter daftar destinasi. Semua nilai masuk ke SQL lewat bind parameter."""
+
+    tokens: tuple[str, ...] = ()  # kata kunci yang sudah dinormalisasi
+    category_id: int | None = None
+    district_id: int | None = None
+    min_price: int | None = None
+    max_price: int | None = None  # 0 = hanya yang gratis
+    min_rating: float | None = None
+    facilities: tuple[str, ...] = ()  # wajib punya SEMUA fasilitas ini
+    crowd_levels: tuple[str, ...] = ()  # salah satu dari level ini (SEPI/SEDANG/RAMAI)
 
 # Hanya kolom yang dipakai DestinationCard yang di-SELECT (description, open_hours, dll. tidak).
 _CARD_COLUMNS = (
@@ -42,6 +82,10 @@ def _rating() -> ColumnElement:
 
 def _rating_count() -> ColumnElement:
     return func.coalesce(Destination.rating_count, 0)
+
+
+def _is_postgres(db: Session) -> bool:
+    return db.get_bind().dialect.name == "postgresql"
 
 
 # ---------------- Banner ----------------
@@ -103,7 +147,7 @@ def _search_condition(
     `tokens` sudah dinormalisasi oleh service: huruf kecil, hanya huruf/angka
     (tidak ada karakter khusus tsquery / wildcard LIKE), jadi aman disusun langsung.
     """
-    if db.get_bind().dialect.name == "postgresql":
+    if _is_postgres(db):
         # Full-text search memakai kolom search_vector (GENERATED dari nama + deskripsi)
         # + GIN index. Config query sama dengan config kolom supaya stemming-nya cocok
         # ("berpasir" -> "pasir"). Tiap kata dicocokkan sebagai awalan supaya hasil sudah
@@ -131,21 +175,66 @@ def _search_condition(
     return match, rank
 
 
+def _facilities_condition(db: Session, facilities: Sequence[str]) -> ColumnElement[bool]:
+    """Destinasi wajib punya SEMUA fasilitas yang diminta (cocok persis, case-sensitive).
+
+    Nilai fasilitas sebaiknya diambil dari GET /home/filters supaya ejaannya sama dengan DB.
+    """
+    if _is_postgres(db):
+        # facilities @> ARRAY[...] -> memakai GIN index ix_destinations_facilities
+        return Destination.facilities.bool_op("@>")(
+            literal(list(facilities), type_=ARRAY(Text))
+        )
+    # Fallback SQLite (test): kolom disimpan sebagai JSON array
+    conditions = []
+    for facility in facilities:
+        items = func.json_each(Destination.facilities).table_valued("value")
+        conditions.append(exists(select(1).select_from(items).where(items.c.value == facility)))
+    return and_(*conditions)
+
+
+def _crowd_condition(levels: Sequence[str]) -> ColumnElement[bool]:
+    """Destinasi yang level keramaiannya salah satu dari `levels` DAN datanya masih baru.
+
+    Data lebih lama dari CROWD_STALE_HOURS dianggap tidak diketahui, jadi tidak ikut.
+    Memakai index ix_crowd_status_level (level, updated_at).
+    """
+    fresh_since = datetime.now(timezone.utc) - timedelta(hours=settings.CROWD_STALE_HOURS)
+    return exists().where(
+        CrowdStatus.destination_id == Destination.id,
+        CrowdStatus.level.in_([CrowdLevel(level) for level in levels]),
+        CrowdStatus.updated_at >= fresh_since,
+    )
+
+
 def _filters(
-    db: Session,
-    *,
-    tokens: Sequence[str],
-    category_id: int | None,
-    district_id: int | None,
+    db: Session, filters: DestinationFilters
 ) -> tuple[list[ColumnElement[bool]], ColumnElement[float] | None]:
     conditions = [_published()]  # publik hanya boleh melihat destinasi PUBLISHED
-    if category_id is not None:
-        conditions.append(Destination.category_id == category_id)
-    if district_id is not None:
-        conditions.append(Destination.district_id == district_id)
+    if filters.category_id is not None:
+        conditions.append(Destination.category_id == filters.category_id)
+    if filters.district_id is not None:
+        conditions.append(Destination.district_id == filters.district_id)
+
+    # Harga: rentang harga destinasi [price_min, price_max] harus beririsan dengan rentang
+    # filter. Destinasi yang harganya belum diisi (NULL) tidak ikut saat filter harga dipakai.
+    if filters.max_price is not None:
+        conditions.append(Destination.price_min <= filters.max_price)
+    if filters.min_price is not None:
+        conditions.append(
+            func.coalesce(Destination.price_max, Destination.price_min) >= filters.min_price
+        )
+
+    if filters.min_rating is not None:
+        conditions.append(_rating() >= filters.min_rating)
+    if filters.facilities:
+        conditions.append(_facilities_condition(db, filters.facilities))
+    if filters.crowd_levels:
+        conditions.append(_crowd_condition(filters.crowd_levels))
+
     rank = None
-    if tokens:
-        match, rank = _search_condition(db, tokens)
+    if filters.tokens:
+        match, rank = _search_condition(db, filters.tokens)
         conditions.append(match)
     return conditions, rank
 
@@ -169,10 +258,8 @@ def _sort_keys(
 
 def list_destination_cards(
     db: Session,
+    filters: DestinationFilters = DestinationFilters(),
     *,
-    tokens: Sequence[str] = (),
-    category_id: int | None = None,
-    district_id: int | None = None,
     sort: SortOption = "name",
     limit: int = 20,
     after: Sequence[Any] | None = None,
@@ -186,9 +273,7 @@ def list_destination_cards(
 
     Return: list (destinasi, nilai_kunci_urutan) -> nilai kunci dipakai untuk membuat cursor.
     """
-    conditions, rank = _filters(
-        db, tokens=tokens, category_id=category_id, district_id=district_id
-    )
+    conditions, rank = _filters(db, filters)
     keys, descending = _sort_keys(sort, rank)
 
     if after is not None:
@@ -207,15 +292,42 @@ def list_destination_cards(
     return [(row[0], list(row[1:])) for row in db.execute(stmt)]
 
 
-def count_destinations(
-    db: Session,
-    *,
-    tokens: Sequence[str] = (),
-    category_id: int | None = None,
-    district_id: int | None = None,
-) -> int:
-    conditions, _ = _filters(db, tokens=tokens, category_id=category_id, district_id=district_id)
+def count_destinations(db: Session, filters: DestinationFilters = DestinationFilters()) -> int:
+    conditions, _ = _filters(db, filters)
     return db.scalar(select(func.count()).select_from(Destination).where(*conditions)) or 0
+
+
+# ---------------- Pilihan filter ----------------
+
+
+def list_facilities_with_count(db: Session) -> list[tuple[str, int]]:
+    """Semua fasilitas yang dipakai destinasi PUBLISHED + jumlah destinasinya (satu query)."""
+    if _is_postgres(db):
+        # unnest(facilities) AS anon(value): pecah array jadi baris
+        items = func.unnest(Destination.facilities).table_valued("value").render_derived()
+    else:
+        items = func.json_each(Destination.facilities).table_valued("value")
+    count = func.count()
+    stmt = (
+        select(items.c.value, count)
+        .select_from(Destination)
+        .join(items, true())
+        .where(_published())
+        .group_by(items.c.value)
+        .order_by(count.desc(), items.c.value.asc())
+    )
+    return [(name, n) for name, n in db.execute(stmt) if name]
+
+
+def price_range(db: Session) -> tuple[int | None, int | None]:
+    """Harga termurah & termahal di antara destinasi PUBLISHED (untuk slider harga)."""
+    row = db.execute(
+        select(
+            func.min(Destination.price_min),
+            func.max(func.coalesce(Destination.price_max, Destination.price_min)),
+        ).where(_published())
+    ).one()
+    return row[0], row[1]
 
 
 # ---------------- Detail destinasi ----------------

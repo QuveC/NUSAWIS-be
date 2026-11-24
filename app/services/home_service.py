@@ -18,7 +18,7 @@ import math
 import re
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -29,8 +29,8 @@ from sqlalchemy.orm import Session
 from app.core.cache import cache_get_or_load, namespaced_key
 from app.core.config import settings
 from app.crud import crud_home
-from app.crud.crud_home import HOME_CACHE_NAMESPACE, SortOption
-from app.models.home import Destination
+from app.crud.crud_home import HOME_CACHE_NAMESPACE, DestinationFilters, SortOption
+from app.models.home import CrowdLevel, Destination
 from app.schemas.home import BannerOut, DestinationCard
 from app.schemas.user import UserOut
 
@@ -38,6 +38,13 @@ MIN_QUERY_LENGTH = 2
 MAX_QUERY_TOKENS = 5
 MAX_TOKEN_LENGTH = 30
 _TOKEN_RE = re.compile(r"[^\W_]+")  # huruf/angka (termasuk unicode), tanpa simbol
+
+MAX_FACILITY_FILTERS = 10
+MAX_FACILITY_LENGTH = 50
+
+# Naikkan setiap kali BENTUK data yang di-cache berubah (mis. field baru di kartu destinasi),
+# supaya entri cache lama tidak dipakai lagi dan memicu error validasi setelah deploy.
+_CACHE_SCHEMA = "s2"
 
 LOGIN_REQUIRED = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -51,13 +58,15 @@ INVALID_CURSOR = HTTPException(
 
 @dataclass(frozen=True)
 class DestinationQuery:
-    tokens: tuple[str, ...] = ()
+    filters: DestinationFilters = DestinationFilters()
     searched: bool = False  # True kalau client mengirim q, meski tidak ada kata yang valid
-    category_id: int | None = None
-    district_id: int | None = None
     sort: SortOption = "name"
     limit: int = settings.DESTINATION_PAGE_SIZE
     cursor: str | None = None
+
+
+def _unprocessable(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 # ---------------- Normalisasi kata kunci ----------------
@@ -71,13 +80,43 @@ def parse_search_query(q: str | None) -> tuple[bool, tuple[str, ...]]:
     if not normalized:
         return False, ()
     if len(normalized) < MIN_QUERY_LENGTH:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"Kata kunci minimal {MIN_QUERY_LENGTH} karakter",
-        )
+        raise _unprocessable(f"Kata kunci minimal {MIN_QUERY_LENGTH} karakter")
     words = (w[:MAX_TOKEN_LENGTH] for w in _TOKEN_RE.findall(normalized.lower()))
     tokens = tuple(dict.fromkeys(words))[:MAX_QUERY_TOKENS]
     return True, tokens
+
+
+def normalize_facilities(values: Sequence[str] | None) -> tuple[str, ...]:
+    """Terima `?facilities=a&facilities=b` maupun `?facilities=a,b`.
+
+    Spasi dirapikan, duplikat dibuang, lalu diurutkan supaya urutan input yang berbeda
+    tetap memakai entri cache yang sama.
+    """
+    if not values:
+        return ()
+    cleaned = {" ".join(part.split()) for value in values for part in value.split(",")}
+    cleaned.discard("")
+    if len(cleaned) > MAX_FACILITY_FILTERS:
+        raise _unprocessable(f"Maksimal {MAX_FACILITY_FILTERS} fasilitas per pencarian")
+    if any(len(facility) > MAX_FACILITY_LENGTH for facility in cleaned):
+        raise _unprocessable(f"Nama fasilitas maksimal {MAX_FACILITY_LENGTH} karakter")
+    return tuple(sorted(cleaned))
+
+
+def normalize_crowd_levels(values: Sequence[str] | None) -> tuple[str, ...]:
+    """Terima `?crowd_level=SEPI&crowd_level=SEDANG` maupun `?crowd_level=sepi,sedang`."""
+    if not values:
+        return ()
+    levels = {part.strip().upper() for value in values for part in value.split(",")}
+    levels.discard("")
+    allowed = {level.value for level in CrowdLevel}
+    invalid = levels - allowed
+    if invalid:
+        raise _unprocessable(
+            f"crowd_level tidak dikenal: {', '.join(sorted(invalid))}. "
+            f"Pilihan: {', '.join(level.value for level in CrowdLevel)}"
+        )
+    return tuple(sorted(levels))
 
 
 def build_query(
@@ -85,19 +124,36 @@ def build_query(
     q: str | None = None,
     category_id: int | None = None,
     district_id: int | None = None,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    min_rating: float | None = None,
+    facilities: Sequence[str] | None = None,
+    crowd_levels: Sequence[str] | None = None,
     sort: SortOption | None = None,
     limit: int = settings.DESTINATION_PAGE_SIZE,
     cursor: str | None = None,
 ) -> DestinationQuery:
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise _unprocessable("min_price tidak boleh lebih besar dari max_price")
+
     searched, tokens = parse_search_query(q)
     effective_sort: SortOption = sort or ("relevance" if tokens else "name")
     if effective_sort == "relevance" and not tokens:
         effective_sort = "rating"  # tanpa kata kunci, "paling relevan" = rating tertinggi
-    return DestinationQuery(
+
+    filters = DestinationFilters(
         tokens=tokens,
-        searched=searched,
         category_id=category_id,
         district_id=district_id,
+        min_price=min_price,
+        max_price=max_price,
+        min_rating=min_rating,
+        facilities=normalize_facilities(facilities),
+        crowd_levels=normalize_crowd_levels(crowd_levels),
+    )
+    return DestinationQuery(
+        filters=filters,
+        searched=searched,
         sort=effective_sort,
         limit=limit,
         cursor=cursor or None,
@@ -173,8 +229,9 @@ def _card(destination: Destination) -> dict:
 
 def _fingerprint(query: DestinationQuery) -> str:
     raw = json.dumps(
-        [query.tokens, query.category_id, query.district_id, query.sort, query.limit, query.cursor],
+        [asdict(query.filters), query.sort, query.limit, query.cursor],
         separators=(",", ":"),
+        sort_keys=True,
     )
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
@@ -184,14 +241,9 @@ def _empty_page(limit: int) -> dict:
 
 
 def _load_page(db: Session, query: DestinationQuery, after: list[Any] | None) -> dict:
-    filters = {
-        "tokens": query.tokens,
-        "category_id": query.category_id,
-        "district_id": query.district_id,
-    }
     # Ambil limit+1 baris: baris ekstra hanya penanda "masih ada halaman berikutnya".
     rows = crud_home.list_destination_cards(
-        db, **filters, sort=query.sort, limit=query.limit + 1, after=after
+        db, query.filters, sort=query.sort, limit=query.limit + 1, after=after
     )
     has_more = len(rows) > query.limit
     rows = rows[: query.limit]
@@ -199,7 +251,7 @@ def _load_page(db: Session, query: DestinationQuery, after: list[Any] | None) ->
     total = None
     if query.cursor is None:
         # COUNT hanya di halaman pertama, dan dilewati kalau semua hasil sudah muat 1 halaman.
-        total = crud_home.count_destinations(db, **filters) if has_more else len(rows)
+        total = crud_home.count_destinations(db, query.filters) if has_more else len(rows)
 
     return {
         "items": [_card(destination) for destination, _ in rows],
@@ -241,14 +293,20 @@ def get_destination_page(db: Session, query: DestinationQuery, user: UserOut | N
             query, limit=max(settings.DESTINATION_PAGE_SIZE, settings.GUEST_PREVIEW_LIMIT)
         )
 
-    if query.searched and not query.tokens:
+    if query.searched and not query.filters.tokens:
         page = _empty_page(query.limit)  # mis. q="%%": tidak ada kata yang bisa dicari
     else:
         after = decode_cursor(query.cursor, query.sort) if query.cursor else None
+        if query.filters.crowd_levels:
+            # Keramaian cepat berubah: cache singkat, tanpa masa sajian data basi yang panjang.
+            ttl = stale_grace = settings.CROWD_LIST_CACHE_TTL_SECONDS
+        else:
+            ttl, stale_grace = settings.DESTINATION_LIST_CACHE_TTL_SECONDS, None
         page = cache_get_or_load(
-            namespaced_key(HOME_CACHE_NAMESPACE, "destinations", _fingerprint(query)),
+            namespaced_key(HOME_CACHE_NAMESPACE, _CACHE_SCHEMA, "destinations", _fingerprint(query)),
             lambda: _load_page(db, query, after),
-            ttl=settings.DESTINATION_LIST_CACHE_TTL_SECONDS,
+            ttl=ttl,
+            stale_grace=stale_grace,
         )
 
     return _guest_preview(page) if guest else {**page, "locked": False, "message": None}
@@ -257,22 +315,30 @@ def get_destination_page(db: Session, query: DestinationQuery, user: UserOut | N
 # ---------------- Ringkasan home ----------------
 
 
+def _category_options(db: Session) -> list[dict]:
+    return [
+        {"id": c.id, "name": c.name, "slug": c.slug, "destination_count": n}
+        for c, n in crud_home.list_categories_with_count(db)
+    ]
+
+
+def _district_options(db: Session) -> list[dict]:
+    return [
+        {"id": d.id, "name": d.name, "destination_count": n}
+        for d, n in crud_home.list_districts_with_count(db)
+    ]
+
+
 def _load_summary(db: Session) -> dict:
-    categories = crud_home.list_categories_with_count(db)
-    districts = crud_home.list_districts_with_count(db)
+    categories = _category_options(db)
     featured = crud_home.list_destination_cards(db, sort="rating", limit=settings.FEATURED_LIMIT)
     banners = crud_home.list_banners(db, only_active=True)
     return {
         "banners": [BannerOut.model_validate(b).model_dump(mode="json") for b in banners],
-        "categories": [
-            {"id": c.id, "name": c.name, "slug": c.slug, "destination_count": n}
-            for c, n in categories
-        ],
-        "districts": [
-            {"id": d.id, "name": d.name, "destination_count": n} for d, n in districts
-        ],
+        "categories": categories,
+        "districts": _district_options(db),
         # category_id wajib (NOT NULL + FK), jadi jumlah per kategori = total destinasi.
-        "total_destinations": sum(n for _, n in categories),
+        "total_destinations": sum(c["destination_count"] for c in categories),
         "featured_destinations": [_card(destination) for destination, _ in featured],
     }
 
@@ -280,8 +346,32 @@ def _load_summary(db: Session) -> dict:
 def get_home_summary(db: Session) -> dict:
     """Bagian home yang sama untuk semua pengunjung (di-cache utuh)."""
     return cache_get_or_load(
-        namespaced_key(HOME_CACHE_NAMESPACE, "summary"),
+        namespaced_key(HOME_CACHE_NAMESPACE, _CACHE_SCHEMA, "summary"),
         lambda: _load_summary(db),
+        ttl=settings.HOME_CACHE_TTL_SECONDS,
+    )
+
+
+def _load_filter_options(db: Session) -> dict:
+    lowest, highest = crud_home.price_range(db)
+    return {
+        "categories": _category_options(db),
+        "districts": _district_options(db),
+        "facilities": [
+            {"name": name, "destination_count": n}
+            for name, n in crud_home.list_facilities_with_count(db)
+        ],
+        "price": {"min": lowest, "max": highest},
+        # tanpa jumlah per level: angkanya berubah terus sehingga cepat basi di cache
+        "crowd_levels": [level.value for level in CrowdLevel],
+    }
+
+
+def get_filter_options(db: Session) -> dict:
+    """Pilihan untuk panel filter (sama untuk semua pengunjung, di-cache utuh)."""
+    return cache_get_or_load(
+        namespaced_key(HOME_CACHE_NAMESPACE, _CACHE_SCHEMA, "filters"),
+        lambda: _load_filter_options(db),
         ttl=settings.HOME_CACHE_TTL_SECONDS,
     )
 

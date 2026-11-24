@@ -7,7 +7,10 @@ from app.schemas.home import (
     DestinationOut,
     DestinationPage,
     DistrictWithCount,
+    FacilityOption,
+    FilterOptions,
     HomeOut,
+    PriceRange,
 )
 from app.schemas.user import (
     AuthResponse,
@@ -27,7 +30,10 @@ __all__ = [
     "DestinationOut",
     "DestinationPage",
     "DistrictWithCount",
+    "FacilityOption",
+    "FilterOptions",
     "HomeOut",
+    "PriceRange",
     "AuthResponse",
     "LoginRequest",
     "RegisterRequest",

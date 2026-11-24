@@ -1,11 +1,12 @@
 import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     FetchedValue,
@@ -38,6 +39,12 @@ class DataStatus(str, enum.Enum):
     PUBLISHED = "PUBLISHED"
 
 
+class CrowdLevel(str, enum.Enum):
+    SEPI = "SEPI"
+    SEDANG = "SEDANG"
+    RAMAI = "RAMAI"
+
+
 class Banner(Base):
     __tablename__ = "banners"
 
@@ -65,6 +72,45 @@ class District(Base):
     name: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
 
 
+class CrowdStatus(Base):
+    """Tingkat keramaian terkini per destinasi (satu baris per destinasi).
+
+    Belum ada fitur yang mengisi tabel ini (input pengunjung oleh Pengelola menyusul).
+    """
+
+    __tablename__ = "crowd_status"
+    __table_args__ = (
+        CheckConstraint("current_visitors >= 0", name="crowd_status_current_visitors_check"),
+        Index("ix_crowd_status_level", "level", "updated_at"),  # migrasi 0003_crowd_filter
+    )
+
+    destination_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("destinations.id", ondelete="CASCADE"), primary_key=True
+    )
+    current_visitors: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    level: Mapped[CrowdLevel] = mapped_column(
+        Enum(CrowdLevel, name="crowd_lvl"),
+        nullable=False,
+        default=CrowdLevel.SEPI,
+        server_default=CrowdLevel.SEPI.value,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def is_fresh(self, max_age_hours: float, now: datetime | None = None) -> bool:
+        """False kalau data lebih lama dari `max_age_hours` (dianggap tidak diketahui)."""
+        updated = self.updated_at
+        if updated is None:
+            return False
+        if updated.tzinfo is None:  # SQLite menyimpan tanpa zona waktu (UTC)
+            updated = updated.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return now - updated <= timedelta(hours=max_age_hours)
+
+
 class Destination(Base):
     __tablename__ = "destinations"
     # Index dibuat di Postgres lewat migrasi alembic (0001_home_search); dideklarasikan juga
@@ -80,6 +126,8 @@ class Destination(Base):
             postgresql_where=text("status = 'PUBLISHED'"),
         ),
         Index("ix_destinations_search_vector", "search_vector", postgresql_using="gin"),
+        # migrasi 0002_destination_filters
+        Index("ix_destinations_facilities", "facilities", postgresql_using="gin"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -134,3 +182,5 @@ class Destination(Base):
 
     category: Mapped[Category] = relationship(lazy="joined")
     district: Mapped[District] = relationship(lazy="joined")
+    # Satu baris per destinasi (PK = destination_id), ikut di-JOIN saat destinasi dimuat.
+    crowd: Mapped[CrowdStatus | None] = relationship(lazy="joined", uselist=False, viewonly=True)

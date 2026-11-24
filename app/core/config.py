@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     CACHE_STALE_GRACE_SECONDS: int = 300
     HOME_HTTP_MAX_AGE_SECONDS: int = 30  # Cache-Control untuk browser / CDN
 
+    # Keramaian: data yang tidak diperbarui lebih dari sekian jam dianggap tidak diketahui.
+    CROWD_STALE_HOURS: float = 6
+    # Hasil yang memakai filter keramaian di-cache lebih singkat karena datanya cepat berubah.
+    CROWD_LIST_CACHE_TTL_SECONDS: int = 30
+
     GUEST_PREVIEW_LIMIT: int = 6  # jumlah destinasi yang boleh dilihat tamu (belum login)
     FEATURED_LIMIT: int = 6
     DESTINATION_PAGE_SIZE: int = 20

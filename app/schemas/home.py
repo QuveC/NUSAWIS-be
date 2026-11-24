@@ -1,9 +1,11 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models.home import DataStatus
+from app.core.config import settings
+from app.models.home import CrowdLevel, DataStatus
 
 
 class BannerBase(BaseModel):
@@ -40,6 +42,35 @@ class DistrictOut(BaseModel):
     name: str
 
 
+class CrowdInfo(BaseModel):
+    level: CrowdLevel | None = Field(
+        description="SEPI / SEDANG / RAMAI. null = belum ada data atau data sudah kedaluwarsa"
+    )
+    updated_at: datetime | None = Field(description="Waktu terakhir data keramaian diperbarui")
+
+
+class CrowdDetail(CrowdInfo):
+    current_visitors: int | None = Field(description="Jumlah pengunjung saat ini (null jika tidak diketahui)")
+
+
+def crowd_snapshot(crowd: Any) -> Any:
+    """Ubah baris CrowdStatus (atau None) jadi data publik.
+
+    Data yang lebih lama dari CROWD_STALE_HOURS tidak ditampilkan levelnya, supaya data
+    kemarin tidak terbaca sebagai keadaan sekarang. Dict (dari cache) diteruskan apa adanya.
+    """
+    if isinstance(crowd, dict):
+        return crowd
+    if crowd is None:
+        return {"level": None, "updated_at": None, "current_visitors": None}
+    fresh = crowd.is_fresh(settings.CROWD_STALE_HOURS)
+    return {
+        "level": crowd.level if fresh else None,
+        "updated_at": crowd.updated_at,
+        "current_visitors": crowd.current_visitors if fresh else None,
+    }
+
+
 class DestinationBase(BaseModel):
     category_id: int
     district_id: int
@@ -71,8 +102,11 @@ class DestinationOut(DestinationBase):
     rating_count: int | None
     category: CategoryOut
     district: DistrictOut
+    crowd: CrowdDetail
     created_at: datetime
     updated_at: datetime
+
+    _crowd = field_validator("crowd", mode="before")(crowd_snapshot)
 
 
 class CategoryWithCount(CategoryOut):
@@ -102,6 +136,9 @@ class DestinationCard(BaseModel):
     rating_count: int | None
     price_min: int | None
     price_max: int | None
+    crowd: CrowdInfo
+
+    _crowd = field_validator("crowd", mode="before")(crowd_snapshot)
 
 
 class DestinationPage(BaseModel):
@@ -118,6 +155,24 @@ class DestinationPage(BaseModel):
         default=False, description="True = tamu, hasil dipotong. Login untuk melihat semua."
     )
     message: str | None = None
+
+
+class FacilityOption(BaseModel):
+    name: str = Field(description="Kirim persis seperti ini di ?facilities=")
+    destination_count: int
+
+
+class PriceRange(BaseModel):
+    min: int | None = Field(description="Harga termurah (Rp), null jika belum ada data harga")
+    max: int | None
+
+
+class FilterOptions(BaseModel):
+    categories: list[CategoryWithCount]
+    districts: list[DistrictWithCount]
+    facilities: list[FacilityOption]
+    price: PriceRange
+    crowd_levels: list[CrowdLevel]
 
 
 class HomeOut(BaseModel):

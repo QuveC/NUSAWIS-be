@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import fakeredis
@@ -9,7 +9,15 @@ from app.core.cache import cache_get_or_load, invalidate_namespace
 from app.core.config import settings
 from app.core.redis import set_redis_client
 from app.crud.crud_home import HOME_CACHE_NAMESPACE
-from app.models.home import Banner, Category, DataStatus, Destination, District
+from app.models.home import (
+    Banner,
+    Category,
+    CrowdLevel,
+    CrowdStatus,
+    DataStatus,
+    Destination,
+    District,
+)
 from tests.test_auth import login, register
 
 API = "/api/v1/home"
@@ -37,6 +45,12 @@ def seed(db):
             name, description = "Pantai Batu Bolong", "Pantai berpasir hitam, cocok untuk selancar"
         if i == 15:
             name = "Air Terjun Tegenungan"
+        # harga bervariasi: 0 = gratis, sebagian belum diisi (None)
+        price_min = None if i % 6 == 5 else (i % 5) * 10_000
+        price_max = price_min + 5_000 if price_min else None
+        facilities = (
+            ["Parkir"] + (["Toilet"] if i % 2 == 0 else []) + (["Mushola"] if i % 3 == 0 else [])
+        )
         dests.append(
             Destination(
                 category_id=category_id,
@@ -52,7 +66,9 @@ def seed(db):
                 # diisi eksplisit: CURRENT_TIMESTAMP SQLite berformat teks lain dari yang
                 # di-bind SQLAlchemy (di Postgres keduanya timestamp asli, tidak masalah)
                 created_at=datetime(2026, 1, 1) + timedelta(days=i % 10),
-                facilities=["parkir"],
+                price_min=price_min,
+                price_max=price_max,
+                facilities=facilities,
             )
         )
     dests.append(
@@ -243,6 +259,187 @@ def test_guest_search_rate_limited(client, db_session):
     assert client.get(f"{API}/destinations").status_code == 200
 
 
+# ---------------- Filter ----------------
+
+
+def _effective_max(d):
+    return d.price_max if d.price_max is not None else d.price_min
+
+
+FILTER_CASES = [
+    ({"max_price": 0}, lambda d: d.price_min is not None and d.price_min <= 0),
+    (
+        {"min_price": 15_000, "max_price": 30_000},
+        lambda d: d.price_min is not None and d.price_min <= 30_000 and _effective_max(d) >= 15_000,
+    ),
+    ({"min_price": 40_000}, lambda d: _effective_max(d) is not None and _effective_max(d) >= 40_000),
+    ({"min_rating": 4.0}, lambda d: (d.avg_rating or 0) >= 4),
+    ({"facilities": ["Toilet", "Mushola"]}, lambda d: {"Toilet", "Mushola"} <= set(d.facilities)),
+    ({"facilities": "Mushola,Toilet"}, lambda d: {"Toilet", "Mushola"} <= set(d.facilities)),
+    (
+        {"q": "pantai", "district_id": 1, "facilities": "Toilet", "max_price": 20_000},
+        lambda d: "pantai" in d.name.lower()
+        and d.district_id == 1
+        and "Toilet" in d.facilities
+        and d.price_min is not None
+        and d.price_min <= 20_000,
+    ),
+]
+
+
+def test_filters_match_expected_rows(client, db_session):
+    dests = seed(db_session)
+    headers = user_headers(client)
+    published = [d for d in dests if d.status == DataStatus.PUBLISHED]
+    for params, predicate in FILTER_CASES:
+        expected = {d.slug for d in published if predicate(d)}
+        assert expected, params  # kasus uji harus punya hasil
+        slugs, _ = collect_all(client, headers, **params)
+        assert sorted(slugs) == sorted(expected), params
+
+        first = client.get(f"{API}/destinations", params=params, headers=headers).json()
+        assert first["total"] == len(expected), params
+
+
+def test_unknown_facility_returns_empty(client, db_session):
+    seed(db_session)
+    body = client.get(f"{API}/destinations", params={"facilities": "Kolam Renang"}).json()
+    assert body["items"] == [] and body["total"] == 0
+
+
+def test_filter_validation(client, db_session):
+    seed(db_session)
+    url = f"{API}/destinations"
+    assert client.get(url, params={"min_price": 50_000, "max_price": 10_000}).status_code == 422
+    assert client.get(url, params={"min_rating": 6}).status_code == 422
+    assert client.get(url, params={"max_price": -1}).status_code == 422
+    too_many = ",".join(f"f{i}" for i in range(11))
+    assert client.get(url, params={"facilities": too_many}).status_code == 422
+
+
+def test_guest_can_filter_but_sees_preview(client, db_session):
+    seed(db_session)
+    body = client.get(f"{API}/destinations", params={"facilities": "Toilet"}).json()
+    assert body["total"] == 13  # i genap dari 0..24
+    assert len(body["items"]) == settings.GUEST_PREVIEW_LIMIT and body["locked"] is True
+
+
+def test_filter_options(client, db_session):
+    dests = seed(db_session)
+    published = [d for d in dests if d.status == DataStatus.PUBLISHED]
+    body = client.get(f"{API}/filters").json()
+
+    expected_facilities = {
+        f: sum(f in d.facilities for d in published) for f in ("Parkir", "Toilet", "Mushola")
+    }
+    assert {f["name"]: f["destination_count"] for f in body["facilities"]} == expected_facilities
+    counts = [f["destination_count"] for f in body["facilities"]]
+    assert counts == sorted(counts, reverse=True)
+
+    assert body["price"] == {"min": 0, "max": 45_000}
+    assert body["crowd_levels"] == ["SEPI", "SEDANG", "RAMAI"]
+    assert {c["slug"] for c in body["categories"]} == {"pantai", "air-terjun", "museum"}
+    assert len(body["districts"]) == 2
+
+
+# ---------------- Filter keramaian ----------------
+
+# (indeks destinasi, level, berapa jam lalu diperbarui). Data > CROWD_STALE_HOURS = kedaluwarsa.
+CROWD_SEED = (
+    [(i, "SEPI", 0) for i in range(0, 5)]
+    + [(i, "SEDANG", 1) for i in range(5, 9)]
+    + [(9, "RAMAI", 0), (10, "RAMAI", 2)]
+    + [(11, "SEPI", 7), (12, "RAMAI", 30)]  # kedaluwarsa
+)
+
+
+def seed_crowd(db, dests):
+    now = datetime.now(timezone.utc)
+    for i, level, hours_ago in CROWD_SEED:
+        db.add(
+            CrowdStatus(
+                destination_id=dests[i].id,
+                level=CrowdLevel(level),
+                current_visitors=10 + i,
+                updated_at=now - timedelta(hours=hours_ago),
+            )
+        )
+    db.commit()
+
+
+def slugs_of(indexes):
+    return sorted(f"wisata-{i:02d}" for i in indexes)
+
+
+def test_crowd_filter(client, db_session):
+    seed_crowd(db_session, seed(db_session))
+    headers = user_headers(client)
+
+    def found(**params):
+        return sorted(collect_all(client, headers, **params)[0])
+
+    assert found(crowd_level="SEPI") == slugs_of(range(0, 5))  # wisata-11 (basi) tidak ikut
+    assert found(crowd_level="RAMAI") == slugs_of([9, 10])  # wisata-12 (basi) tidak ikut
+    assert found(crowd_level=["SEPI", "SEDANG"]) == slugs_of(range(0, 9))
+    assert found(crowd_level="sepi,sedang") == slugs_of(range(0, 9))
+    # digabung filter lain: SEDANG di kecamatan 2 (indeks ganjil)
+    assert found(crowd_level="SEDANG", district_id=2) == slugs_of([5, 7])
+    assert found(crowd_level="SEPI", q="batu bolong") == slugs_of([0])
+
+
+def test_crowd_info_on_card_and_detail(client, db_session):
+    dests = seed(db_session)
+    seed_crowd(db_session, dests)
+    headers = user_headers(client)
+    cards = {}
+    cursor = None
+    while True:
+        params = {"limit": 50, **({"cursor": cursor} if cursor else {})}
+        body = client.get(f"{API}/destinations", params=params, headers=headers).json()
+        cards.update({c["slug"]: c["crowd"] for c in body["items"]})
+        if not (cursor := body["next_cursor"]):
+            break
+
+    assert cards["wisata-00"]["level"] == "SEPI" and cards["wisata-00"]["updated_at"]
+    assert "current_visitors" not in cards["wisata-00"]  # jumlah pengunjung hanya di detail
+    assert cards["wisata-11"]["level"] is None and cards["wisata-11"]["updated_at"]  # basi
+    assert cards["wisata-20"] == {"level": None, "updated_at": None}  # belum ada data
+
+    fresh = client.get(f"{API}/destinations/{dests[0].id}").json()["crowd"]
+    assert fresh["level"] == "SEPI" and fresh["current_visitors"] == 10
+    stale = client.get(f"{API}/destinations/slug/wisata-11").json()["crowd"]
+    assert stale["level"] is None and stale["current_visitors"] is None
+    none = client.get(f"{API}/destinations/slug/wisata-20").json()["crowd"]
+    assert none == {"level": None, "updated_at": None, "current_visitors": None}
+
+
+def test_crowd_filter_validation_and_guest(client, db_session):
+    seed_crowd(db_session, seed(db_session))
+    url = f"{API}/destinations"
+    r = client.get(url, params={"crowd_level": "PADAT"})
+    assert r.status_code == 422 and "PADAT" in r.json()["detail"]
+
+    body = client.get(url, params={"crowd_level": "SEPI,SEDANG"}).json()
+    assert body["total"] == 9
+    assert len(body["items"]) == settings.GUEST_PREVIEW_LIMIT and body["locked"] is True
+
+
+def test_crowd_filter_uses_short_cache(client, db_session, redis_client):
+    seed_crowd(db_session, seed(db_session))
+
+    def list_key_ttls():
+        return {k: redis_client.ttl(k) for k in redis_client.keys("cache:home:*:destinations:*")}
+
+    client.get(f"{API}/destinations", params={"crowd_level": "SEPI"})
+    crowd_ttls = list_key_ttls()
+    assert len(crowd_ttls) == 1
+    assert 0 < max(crowd_ttls.values()) <= 2 * settings.CROWD_LIST_CACHE_TTL_SECONDS
+
+    client.get(f"{API}/destinations")  # tanpa filter keramaian -> cache normal
+    normal = {k: t for k, t in list_key_ttls().items() if k not in crowd_ttls}
+    assert min(normal.values()) > 2 * settings.CROWD_LIST_CACHE_TTL_SECONDS
+
+
 # ---------------- Cache ----------------
 
 
@@ -316,7 +513,7 @@ def test_get_destination_by_id_and_slug(client, db_session):
     dests = seed(db_session)
     r = client.get(f"{API}/destinations/{dests[0].id}")
     assert r.status_code == 200 and r.json()["name"] == "Pantai Batu Bolong"
-    assert r.json()["facilities"] == ["parkir"]
+    assert r.json()["facilities"] == ["Parkir", "Toilet", "Mushola"]
     assert client.get(f"{API}/destinations/slug/wisata-01").status_code == 200
     # draft tidak terlihat publik
     assert client.get(f"{API}/destinations/{dests[-1].id}").status_code == 404
