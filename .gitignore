@@ -9,3 +9,4 @@ venv/
 # Catatan lokal (tidak di-commit)
 PROGRESS.md
 docs/AUTH.md
+docs/*.md
