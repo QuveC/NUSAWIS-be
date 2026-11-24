@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -19,10 +20,11 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    select,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from app.core.database import Base
@@ -111,6 +113,34 @@ class CrowdStatus(Base):
         return now - updated <= timedelta(hours=max_age_hours)
 
 
+class DestinationPhoto(Base):
+    """Foto destinasi. sort_order terkecil = foto sampul (cover).
+
+    Tabel dibuat lewat sql/001_destination_photos.sql; definisi di sini harus sama.
+    """
+
+    __tablename__ = "destination_photos"
+    __table_args__ = (
+        UniqueConstraint("destination_id", "url", name="uq_destination_photos_destination_url"),
+        CheckConstraint(
+            "url LIKE 'http://%' OR url LIKE 'https://%'", name="ck_destination_photos_url_http"
+        ),
+        Index("ix_destination_photos_destination", "destination_id", "sort_order", "id"),
+    )
+
+    # BIGSERIAL di Postgres; INTEGER di SQLite supaya tetap auto-increment saat test
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    destination_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("destinations.id", ondelete="CASCADE"), nullable=False
+    )
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    caption: Mapped[str | None] = mapped_column(String(150))
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Destination(Base):
     __tablename__ = "destinations"
     # Index dibuat di Postgres lewat migrasi alembic (0001_home_search); dideklarasikan juga
@@ -184,3 +214,19 @@ class Destination(Base):
     district: Mapped[District] = relationship(lazy="joined")
     # Satu baris per destinasi (PK = destination_id), ikut di-JOIN saat destinasi dimuat.
     crowd: Mapped[CrowdStatus | None] = relationship(lazy="joined", uselist=False, viewonly=True)
+
+    # Foto sampul untuk kartu: subquery "foto pertama" (pakai index destinasi+urutan).
+    # deferred: hanya dihitung kalau diminta (query kartu memintanya lewat load_only).
+    cover_photo_url: Mapped[str | None] = column_property(
+        select(DestinationPhoto.url)
+        .where(DestinationPhoto.destination_id == id)
+        .order_by(DestinationPhoto.sort_order, DestinationPhoto.id)
+        .limit(1)
+        .correlate_except(DestinationPhoto)
+        .scalar_subquery(),
+        deferred=True,
+    )
+    # Galeri lengkap untuk halaman detail (dimuat eksplisit dengan selectinload).
+    photos: Mapped[list[DestinationPhoto]] = relationship(
+        order_by=[DestinationPhoto.sort_order, DestinationPhoto.id], viewonly=True
+    )

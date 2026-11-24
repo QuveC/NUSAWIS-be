@@ -9,6 +9,9 @@ from app.core.cache import cache_get_or_load, invalidate_namespace
 from app.core.config import settings
 from app.core.redis import set_redis_client
 from app.crud.crud_home import HOME_CACHE_NAMESPACE
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from app.models.home import (
     Banner,
     Category,
@@ -16,12 +19,16 @@ from app.models.home import (
     CrowdStatus,
     DataStatus,
     Destination,
+    DestinationPhoto,
     District,
 )
 from tests.test_auth import login, register
 
 API = "/api/v1/home"
 N_PUBLISHED = 25
+PHOTO_A = "https://example.com/foto/batu-bolong-senja.jpg"
+PHOTO_B = "https://example.com/foto/batu-bolong-pasir.jpg"
+PHOTO_C = "https://example.com/foto/wisata-01.jpg"
 
 
 def seed(db):
@@ -78,6 +85,15 @@ def seed(db):
         )
     )
     db.add_all(dests)
+    db.flush()
+    db.add_all(
+        [
+            # sengaja dimasukkan terbalik: urutan harus mengikuti sort_order, bukan urutan insert
+            DestinationPhoto(destination_id=dests[0].id, url=PHOTO_B, caption="Pasir", sort_order=1),
+            DestinationPhoto(destination_id=dests[0].id, url=PHOTO_A, caption="Senja", sort_order=0),
+            DestinationPhoto(destination_id=dests[1].id, url=PHOTO_C, sort_order=0),
+        ]
+    )
     db.add_all(
         [
             Banner(title="Promo", image_url="https://example.com/a.jpg", sort_order=1),
@@ -438,6 +454,44 @@ def test_crowd_filter_uses_short_cache(client, db_session, redis_client):
     client.get(f"{API}/destinations")  # tanpa filter keramaian -> cache normal
     normal = {k: t for k, t in list_key_ttls().items() if k not in crowd_ttls}
     assert min(normal.values()) > 2 * settings.CROWD_LIST_CACHE_TTL_SECONDS
+
+
+# ---------------- Foto ----------------
+
+
+def test_card_has_cover_photo(client, db_session):
+    seed(db_session)
+    headers = user_headers(client)
+    cards = {
+        c["slug"]: c
+        for c in client.get(f"{API}/destinations", params={"limit": 50}, headers=headers).json()["items"]
+    }
+    assert cards["wisata-00"]["cover_photo_url"] == PHOTO_A  # sort_order 0, bukan yang pertama di-insert
+    assert cards["wisata-01"]["cover_photo_url"] == PHOTO_C
+    assert cards["wisata-02"]["cover_photo_url"] is None
+    assert "photos" not in cards["wisata-00"]  # galeri hanya di detail
+
+    # kartu di home (unggulan & daftar) juga membawa foto sampul
+    home = client.get(API).json()
+    assert all("cover_photo_url" in c for c in home["featured_destinations"])
+
+
+def test_detail_has_photo_gallery(client, db_session):
+    dests = seed(db_session)
+    photos = client.get(f"{API}/destinations/{dests[0].id}").json()["photos"]
+    assert photos == [{"url": PHOTO_A, "caption": "Senja"}, {"url": PHOTO_B, "caption": "Pasir"}]
+    assert client.get(f"{API}/destinations/slug/wisata-01").json()["photos"] == [
+        {"url": PHOTO_C, "caption": None}
+    ]
+    assert client.get(f"{API}/destinations/slug/wisata-02").json()["photos"] == []
+
+
+def test_photo_url_must_be_http(db_session):
+    dests = seed(db_session)
+    db_session.add(DestinationPhoto(destination_id=dests[2].id, url="javascript:alert(1)"))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
 
 
 # ---------------- Cache ----------------

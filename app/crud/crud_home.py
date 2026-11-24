@@ -20,7 +20,7 @@ from sqlalchemy import (
     tuple_,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm import Session, load_only, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.cache import invalidate_namespace
@@ -69,6 +69,7 @@ _CARD_COLUMNS = (
     Destination.rating_count,
     Destination.price_min,
     Destination.price_max,
+    Destination.cover_photo_url,  # subquery foto pertama, hanya untuk kartu
 )
 
 
@@ -336,7 +337,7 @@ def price_range(db: Session) -> tuple[int | None, int | None]:
 def get_destination(
     db: Session, destination_id: uuid.UUID, only_published: bool = True
 ) -> Destination | None:
-    destination = db.get(Destination, destination_id)
+    destination = db.get(Destination, destination_id, options=[selectinload(Destination.photos)])
     if destination is None:
         return None
     if only_published and destination.status != DataStatus.PUBLISHED:
@@ -347,7 +348,11 @@ def get_destination(
 def get_destination_by_slug(
     db: Session, slug: str, only_published: bool = True
 ) -> Destination | None:
-    stmt = select(Destination).where(Destination.slug == slug)
+    stmt = (
+        select(Destination)
+        .options(selectinload(Destination.photos))
+        .where(Destination.slug == slug)
+    )
     if only_published:
         stmt = stmt.where(Destination.status == DataStatus.PUBLISHED)
     return db.scalars(stmt).unique().first()

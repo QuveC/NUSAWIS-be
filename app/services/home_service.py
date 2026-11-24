@@ -44,7 +44,7 @@ MAX_FACILITY_LENGTH = 50
 
 # Naikkan setiap kali BENTUK data yang di-cache berubah (mis. field baru di kartu destinasi),
 # supaya entri cache lama tidak dipakai lagi dan memicu error validasi setelah deploy.
-_CACHE_SCHEMA = "s2"
+_CACHE_SCHEMA = "s3"
 
 LOGIN_REQUIRED = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,

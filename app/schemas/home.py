@@ -71,6 +71,13 @@ def crowd_snapshot(crowd: Any) -> Any:
     }
 
 
+class PhotoOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    url: str
+    caption: str | None
+
+
 class DestinationBase(BaseModel):
     category_id: int
     district_id: int
@@ -103,6 +110,7 @@ class DestinationOut(DestinationBase):
     category: CategoryOut
     district: DistrictOut
     crowd: CrowdDetail
+    photos: list[PhotoOut] = Field(description="Galeri foto, urut sort_order (pertama = sampul)")
     created_at: datetime
     updated_at: datetime
 
@@ -136,6 +144,7 @@ class DestinationCard(BaseModel):
     rating_count: int | None
     price_min: int | None
     price_max: int | None
+    cover_photo_url: str | None = Field(description="Foto sampul. null = belum ada foto")
     crowd: CrowdInfo
 
     _crowd = field_validator("crowd", mode="before")(crowd_snapshot)
