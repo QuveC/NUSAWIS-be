@@ -75,6 +75,56 @@ class DestinationOut(DestinationBase):
     updated_at: datetime
 
 
+class CategoryWithCount(CategoryOut):
+    destination_count: int
+
+
+class DistrictWithCount(DistrictOut):
+    destination_count: int
+
+
+class DestinationCard(BaseModel):
+    """Versi ringkas destinasi untuk daftar/kartu di home & hasil pencarian.
+
+    Sengaja tanpa description, open_hours, facilities, dll. supaya payload kecil.
+    Data lengkap diambil lewat endpoint detail.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    slug: str
+    address: str
+    category: CategoryOut
+    district: DistrictOut
+    avg_rating: float | None
+    rating_count: int | None
+    price_min: int | None
+    price_max: int | None
+
+
+class DestinationPage(BaseModel):
+    items: list[DestinationCard]
+    total: int | None = Field(
+        description="Jumlah seluruh hasil. Hanya dihitung di halaman pertama (tanpa cursor)."
+    )
+    limit: int
+    has_more: bool
+    next_cursor: str | None = Field(
+        description="Kirim sebagai ?cursor= untuk halaman berikutnya (khusus user login)."
+    )
+    locked: bool = Field(
+        default=False, description="True = tamu, hasil dipotong. Login untuk melihat semua."
+    )
+    message: str | None = None
+
+
 class HomeOut(BaseModel):
+    is_authenticated: bool
     banners: list[BannerOut]
-    featured_destinations: list[DestinationOut]
+    categories: list[CategoryWithCount]
+    districts: list[DistrictWithCount]
+    total_destinations: int
+    featured_destinations: list[DestinationCard]
+    destinations: DestinationPage

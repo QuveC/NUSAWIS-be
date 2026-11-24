@@ -1,8 +1,12 @@
 from app.schemas.home import (
     BannerCreate,
     BannerOut,
+    CategoryWithCount,
+    DestinationCard,
     DestinationCreate,
     DestinationOut,
+    DestinationPage,
+    DistrictWithCount,
     HomeOut,
 )
 from app.schemas.user import (
@@ -17,8 +21,12 @@ from app.schemas.user import (
 __all__ = [
     "BannerCreate",
     "BannerOut",
+    "CategoryWithCount",
+    "DestinationCard",
     "DestinationCreate",
     "DestinationOut",
+    "DestinationPage",
+    "DistrictWithCount",
     "HomeOut",
     "AuthResponse",
     "LoginRequest",

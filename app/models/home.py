@@ -8,7 +8,9 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    FetchedValue,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     SmallInteger,
@@ -16,16 +18,18 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from app.core.database import Base
 
-# JSONB / TEXT[] di Postgres, JSON biasa di SQLite (untuk test)
+# JSONB / TEXT[] / TSVECTOR di Postgres, tipe biasa di SQLite (untuk test)
 JSONType = JSON().with_variant(JSONB(), "postgresql")
 TextArray = JSON().with_variant(ARRAY(Text), "postgresql")
+TSVectorType = Text().with_variant(TSVECTOR(), "postgresql")
 
 
 class DataStatus(str, enum.Enum):
@@ -63,7 +67,20 @@ class District(Base):
 
 class Destination(Base):
     __tablename__ = "destinations"
-    __table_args__ = (UniqueConstraint("name", "address"),)
+    # Index dibuat di Postgres lewat migrasi alembic (0001_home_search); dideklarasikan juga
+    # di sini supaya `alembic revision --autogenerate` tidak mengusulkan menghapusnya.
+    __table_args__ = (
+        UniqueConstraint("name", "address"),
+        Index("ix_destinations_status_category", "status", "category_id"),
+        Index("ix_destinations_status_district", "status", "district_id"),
+        Index(
+            "ix_destinations_published_name",
+            "name",
+            "id",
+            postgresql_where=text("status = 'PUBLISHED'"),
+        ),
+        Index("ix_destinations_search_vector", "search_vector", postgresql_using="gin"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid, primary_key=True, default=uuid.uuid4, server_default=func.gen_random_uuid()
@@ -103,7 +120,17 @@ class Destination(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
     )
-    # search_vector (TSVECTOR) sengaja tidak dipetakan; diisi oleh database.
+    # Di Postgres ini kolom GENERATED ALWAYS:
+    #   to_tsvector('indonesian', coalesce(name,'') || ' ' || coalesce(description,''))
+    # Diisi database, tidak pernah ditulis app. FetchedValue = beri tahu SQLAlchemy nilainya
+    # dibuat server, jadi kolom ini tidak pernah ikut INSERT/UPDATE (Postgres menolak nilai
+    # apa pun, termasuk NULL, untuk kolom generated). deferred = tidak ikut di-SELECT.
+    search_vector: Mapped[str | None] = mapped_column(
+        TSVectorType,
+        server_default=FetchedValue(),
+        server_onupdate=FetchedValue(),
+        deferred=True,
+    )
 
     category: Mapped[Category] = relationship(lazy="joined")
     district: Mapped[District] = relationship(lazy="joined")

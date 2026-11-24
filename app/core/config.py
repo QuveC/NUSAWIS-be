@@ -47,6 +47,26 @@ class Settings(BaseSettings):
     LOGIN_MAX_FAILED_ATTEMPTS: int = 5
     LOGIN_LOCKOUT_SECONDS: int = 900
 
+    # --- Home & pencarian destinasi ---
+    # Cache Redis (stale-while-revalidate): data dianggap segar selama TTL, lalu masih boleh
+    # disajikan selama STALE_GRACE sambil SATU worker memperbarui di belakang.
+    HOME_CACHE_TTL_SECONDS: int = 300  # ringkasan home: banner, kategori, kecamatan, unggulan
+    DESTINATION_LIST_CACHE_TTL_SECONDS: int = 120  # daftar & hasil pencarian
+    CACHE_STALE_GRACE_SECONDS: int = 300
+    HOME_HTTP_MAX_AGE_SECONDS: int = 30  # Cache-Control untuk browser / CDN
+
+    GUEST_PREVIEW_LIMIT: int = 6  # jumlah destinasi yang boleh dilihat tamu (belum login)
+    FEATURED_LIMIT: int = 6
+    DESTINATION_PAGE_SIZE: int = 20
+    DESTINATION_MAX_PAGE_SIZE: int = 50
+
+    # Rate limit endpoint /home (per IP untuk tamu, per akun untuk user login)
+    HOME_RATE_LIMIT_GUEST: int = 60
+    HOME_RATE_LIMIT_USER: int = 240
+    SEARCH_RATE_LIMIT_GUEST: int = 20
+    SEARCH_RATE_LIMIT_USER: int = 60
+    HOME_RATE_WINDOW_SECONDS: int = 60
+
     # Aktifkan hanya jika app berada di belakang reverse proxy terpercaya (nginx, dll)
     TRUST_PROXY_HEADERS: bool = False
 

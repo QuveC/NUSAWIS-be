@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import math
 import time
 import uuid
@@ -8,6 +9,8 @@ from fastapi import HTTPException, Request, status
 
 from app.core.config import settings
 from app.core.redis import get_redis, redis_unavailable
+
+logger = logging.getLogger(__name__)
 
 
 def get_client_ip(request: Request) -> str:
@@ -51,6 +54,29 @@ def hit_sliding_window(key: str, limit: int, window_seconds: int) -> tuple[bool,
     return False, retry_after
 
 
+def enforce_rate_limit(
+    key: str, limit: int, window_seconds: int, *, fail_open: bool = False
+) -> None:
+    """Raise 429 jika `key` melewati `limit` hit dalam `window_seconds`.
+
+    fail_open=True: kalau Redis mati, request tetap dilayani (dipakai untuk endpoint
+    browsing publik). False: ikut REDIS_FAIL_OPEN (dipakai untuk endpoint keamanan).
+    """
+    try:
+        allowed, retry_after = hit_sliding_window(key, limit, window_seconds)
+    except redis.RedisError as exc:
+        if fail_open:
+            logger.warning("Rate limiter dilewati, Redis tidak tersedia: %s", exc)
+            return
+        redis_unavailable(exc)
+        return
+    if not allowed:
+        raise _too_many(
+            retry_after,
+            f"Terlalu banyak request. Coba lagi dalam {retry_after} detik",
+        )
+
+
 class RateLimiter:
     """Dependency FastAPI: batasi jumlah request per IP untuk satu scope."""
 
@@ -61,16 +87,7 @@ class RateLimiter:
 
     def __call__(self, request: Request) -> None:
         key = f"rl:{self.scope}:{get_client_ip(request)}"
-        try:
-            allowed, retry_after = hit_sliding_window(key, self.limit, self.window_seconds)
-        except redis.RedisError as exc:
-            redis_unavailable(exc)
-            return
-        if not allowed:
-            raise _too_many(
-                retry_after,
-                f"Terlalu banyak request. Coba lagi dalam {retry_after} detik",
-            )
+        enforce_rate_limit(key, self.limit, self.window_seconds)
 
 
 # ---------------- Lockout per akun ----------------
